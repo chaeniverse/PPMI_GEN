@@ -1,0 +1,24 @@
+# data / outputs (DO NOT COMMIT)
+PPMI/
+data/
+mri2datscan/
+outputs/
+checkpoints/
+models/
+*.ckpt
+*.safetensors
+*.pt
+*.bin
+.md
+
+# caches
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.cache/
+wandb/
+runs/
+
+# env
+.venv/
+.env
