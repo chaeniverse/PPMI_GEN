@@ -22,3 +22,45 @@ runs/
 # env
 .venv/
 .env
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ===== Virtual Envs =====
+.venv/
+venv/
+env/
+
+# ===== HuggingFace / Diffusers =====
+.cache/
+.cache/huggingface/
+.huggingface/
+accelerate_config.yaml
+wandb/
+logs/
+
+# ===== Model outputs / checkpoints =====
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+*.pth
+output/
+outputs/
+checkpoints/
+models/
+
+# ===== Temporary / backup files =====
+*.bak
+*.bak.*
+train_controlnet_sdxl.bak
+train_controlnet_sdxl.bak.20251231_073005
+train_controlnet_sdxl.bak2
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
