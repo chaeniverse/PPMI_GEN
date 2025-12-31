@@ -22,6 +22,7 @@ accelerate launch \
   --pretrained_model_name_or_path stabilityai/stable-diffusion-xl-base-1.0 \
   --variant fp16 \
   --mixed_precision fp16 \
+  --pre_compute_text_embeddings \
   --train_data_dir "$TRAIN_DIR" \
   --image_column image \
   --conditioning_image_column conditioning_image \
@@ -39,6 +40,10 @@ accelerate launch \
   --use_8bit_adam \
   --output_dir /workspace/mri2datscan/models/controlnet_sdxl_ppmi
 
+
+If you see `ValueError: Batch missing pooled/text embeds` early in training, re-run with
+`--pre_compute_text_embeddings` (as in the command above). This forces the SDXL example
+script to create the pooled/text embeddings it expects, avoiding that startup crash.
 
 
 
