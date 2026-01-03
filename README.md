@@ -8,11 +8,17 @@ python /workspace/PPMI_GEN/scripts/prepare_dataset.py \
   --resolution 512 \
   --n_slices 7 \
   --max_delta_days 365 \
-  --max_pairs 50
+  --max_pairs 50 \
+  --dat_crop 160 \
+  --dat_crop_mode hotspot
+
 
 ```
 ## Train
 ```bash
+export TRAIN_DIR=/workspace/mri2datscan/ppmi_mri2datscan/data/train
+cd /workspace/PPMI_GEN/diffusers/examples/controlnet
+
 accelerate launch \
   --num_processes 1 \
   --mixed_precision fp16 \
