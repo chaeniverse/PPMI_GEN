@@ -747,15 +747,30 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
                 output_hidden_states=True,
             )
 
+
             # We are only ALWAYS interested in the pooled output of the final text encoder
-            pooled_prompt_embeds = prompt_embeds[0]
+            # --- FIX: robust pooled extraction (must be 2D) ---
+            if hasattr(prompt_embeds, "text_embeds") and prompt_embeds.text_embeds is not None:
+                pooled_prompt_embeds = prompt_embeds.text_embeds               # usually (B, H) for *WithProjection
+            elif hasattr(prompt_embeds, "pooler_output") and prompt_embeds.pooler_output is not None:
+                pooled_prompt_embeds = prompt_embeds.pooler_output             # usually (B, H) for CLIPTextModel
+            elif isinstance(prompt_embeds, (tuple, list)) and len(prompt_embeds) > 1 and torch.is_tensor(prompt_embeds[1]):
+                pooled_prompt_embeds = prompt_embeds[1]                        # fallback
+            else:
+                pooled_prompt_embeds = prompt_embeds[0]                        # last resort
+
+            # pooled must be 2D. If it's 3D, it's NOT pooled.
+            if pooled_prompt_embeds.ndim != 2:
+                raise ValueError(f"pooled_prompt_embeds must be 2D, got {tuple(pooled_prompt_embeds.shape)}")
+            # --- end FIX ---
             prompt_embeds = prompt_embeds.hidden_states[-2]
             bs_embed, seq_len, _ = prompt_embeds.shape
             prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
             prompt_embeds_list.append(prompt_embeds)
 
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
-    pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
+    pooled_prompt_embeds = pooled_prompt_embeds.view(pooled_prompt_embeds.shape[0], -1)
+
     return prompt_embeds, pooled_prompt_embeds
 
 
@@ -805,25 +820,29 @@ def prepare_train_dataset(dataset, accelerator):
 
     return dataset
 
-
 def collate_fn(examples):
-    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    pixel_values = torch.stack([ex["pixel_values"] for ex in examples]).float()
+    conditioning_pixel_values = torch.stack([ex["conditioning_pixel_values"] for ex in examples]).float()
 
-    conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
-    conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
-
-    prompt_ids = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
-
-    add_text_embeds = torch.stack([torch.tensor(example["text_embeds"]) for example in examples])
-    add_time_ids = torch.stack([torch.tensor(example["time_ids"]) for example in examples])
+    # datasets가 텐서/리스트로 줄 수 있어서 torch.tensor로 감싸줌
+    prompt_embeds = torch.stack([torch.tensor(ex["prompt_embeds"]) for ex in examples])
+    pooled_prompt_embeds = torch.stack([torch.tensor(ex["pooled_prompt_embeds"]) for ex in examples])
+    time_ids = torch.stack([torch.tensor(ex["time_ids"]) for ex in examples])
 
     return {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
-        "prompt_ids": prompt_ids,
-        "unet_added_conditions": {"text_embeds": add_text_embeds, "time_ids": add_time_ids},
+        "prompt_embeds": prompt_embeds,
+        "pooled_prompt_embeds": pooled_prompt_embeds,  # ✅ 추가
+        "time_ids": time_ids,                          # ✅ 추가
+        "unet_added_conditions": {
+            "text_embeds": pooled_prompt_embeds,
+            "time_ids": time_ids,
+        },
     }
+
+
+
 
 
 def main(args):
@@ -1074,19 +1093,22 @@ def main(args):
         prompt_embeds, pooled_prompt_embeds = encode_prompt(
             prompt_batch, text_encoders, tokenizers, proportion_empty_prompts, is_train
         )
-        add_text_embeds = pooled_prompt_embeds
 
-        # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
-        add_time_ids = torch.tensor([add_time_ids])
+        add_time_ids = torch.tensor([add_time_ids]).repeat(len(prompt_batch), 1)
 
-        prompt_embeds = prompt_embeds.to(accelerator.device)
-        add_text_embeds = add_text_embeds.to(accelerator.device)
-        add_time_ids = add_time_ids.repeat(len(prompt_batch), 1)
-        add_time_ids = add_time_ids.to(accelerator.device, dtype=prompt_embeds.dtype)
-        unet_added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+        # ✅ datasets에 저장될 값은 CPU로 (나중에 training loop에서 GPU로 올리면 됨)
+        prompt_embeds = prompt_embeds.detach().cpu()
+        pooled_prompt_embeds = pooled_prompt_embeds.detach().cpu()
+        add_time_ids = add_time_ids.detach().cpu()
 
-        return {"prompt_embeds": prompt_embeds, **unet_added_cond_kwargs}
+        return {
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_prompt_embeds,
+            "time_ids": add_time_ids,
+        }
+
+
 
     # Let's first compute all the embeddings so that we can free up the text encoders
     # from memory.
@@ -1104,8 +1126,16 @@ def main(args):
 
         # fingerprint used by the cache for the other processes to load the result
         # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
-        new_fingerprint = Hasher.hash(args)
-        train_dataset = train_dataset.map(compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint)
+
+        new_fingerprint = Hasher.hash(str(vars(args)) + "|emb_v2")  # ✅ 버전 문자열 추가
+        train_dataset = train_dataset.map(
+            compute_embeddings_fn,
+            batched=True,
+            new_fingerprint=new_fingerprint,
+            load_from_cache_file=False,  # ✅ 캐시 무시하고 재계산
+        )
+        if accelerator.is_main_process:
+            print("column_names:", train_dataset.column_names)
 
     del text_encoders, tokenizers
     gc.collect()
@@ -1251,76 +1281,41 @@ def main(args):
 
                 # ControlNet conditioning.
                 controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+
+                # (for-loop 안, controlnet 호출 직전)
+                batch["prompt_embeds"] = batch["prompt_embeds"].to(accelerator.device, dtype=weight_dtype)
+                batch["pooled_prompt_embeds"] = batch["pooled_prompt_embeds"].to(accelerator.device, dtype=weight_dtype)
+                batch["time_ids"] = batch["time_ids"].to(accelerator.device, dtype=weight_dtype)
+
+                batch["unet_added_conditions"] = {
+                    "text_embeds": batch["pooled_prompt_embeds"],  # 반드시 2D
+                    "time_ids": batch["time_ids"],                 # (B, 6)
+                }
+
+                if global_step == 0 and step == 0:
+                    print("prompt_embeds:", batch["prompt_embeds"].shape)
+                    print("text_embeds:", batch["unet_added_conditions"]["text_embeds"].shape)
+                    print("time_ids:", batch["unet_added_conditions"]["time_ids"].shape)
+
+
                 down_block_res_samples, mid_block_res_sample = controlnet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=batch["prompt_ids"],
-                    added_cond_kwargs=batch["unet_added_conditions"],
+                    encoder_hidden_states=batch["prompt_embeds"],            # ✅ 3D
+                    added_cond_kwargs=batch["unet_added_conditions"],        # ✅ text_embeds(2D), time_ids(2D)
                     controlnet_cond=controlnet_image,
                     return_dict=False,
                 )
 
+
+
                 # Predict the noise residual
-                # CHL_FORCE_DTYPE_MATCH
-                # ---- FIX: make sure prompt_embeds exists ----
-                prompt_embeds = locals().get("prompt_embeds", None)
-                if prompt_embeds is None:
-                    # depending on script version, embeddings may be stored in batch
-                    if isinstance(batch, dict):
-                        prompt_embeds = batch.get("prompt_embeds", batch.get("prompt_ids"))
-                    if prompt_embeds is None:
-                        raise ValueError(f"Batch missing prompt embeddings. keys={list(batch.keys())}")
-
-                prompt_embeds = prompt_embeds.to(device=accelerator.device, dtype=weight_dtype)
-                # --------------------------------------------
-                # ---- FIX: make sure pooled_prompt_embeds exists ----
-                pooled_prompt_embeds = locals().get("pooled_prompt_embeds", None)
-                # ---- HOTFIX: make pooled/text embeds if missing (SDXL requires them) ----
-                if "unet_added_conditions" in batch and "text_embeds" not in batch["unet_added_conditions"]:
-                    with torch.no_grad():
-                        prompt_ids = batch["prompt_ids"]
-
-                        # 있으면 prompt_ids_2를 쓰고, 없으면 prompt_ids를 재사용(대부분 SDXL에서 tokenizer vocab이 같아서 일단 동작)
-                        prompt_ids_2 = batch.get("prompt_ids_2", prompt_ids)
-
-                        prompt_embeds_list = []
-
-                        # ✅ 아래 두 줄의 변수명(text_encoder / text_encoder_2)은 네 스크립트에 맞게 바꾸기
-                        for ids, encoder in [(prompt_ids, text_encoder), (prompt_ids_2, text_encoder_2)]:
-                            out = encoder(ids.to(encoder.device), output_hidden_states=True)
-                            pooled = out[0]                      # pooled output
-                            hidden = out.hidden_states[-2]       # penultimate hidden states
-                            prompt_embeds_list.append(hidden.to(accelerator.device, dtype=weight_dtype))
-
-                        prompt_embeds = torch.cat(prompt_embeds_list, dim=-1)
-                        pooled_prompt_embeds = pooled.view(pooled.shape[0], -1).to(accelerator.device, dtype=weight_dtype)
-
-                    # 스크립트가 어떤 키를 기대하든 최대한 맞춰서 채워줌
-                    batch["prompt_embeds"] = prompt_embeds
-                    batch["pooled_prompt_embeds"] = pooled_prompt_embeds
-                    batch["unet_added_conditions"]["text_embeds"] = pooled_prompt_embeds
-                # ------------------------------------------------------------------------
-
-                if pooled_prompt_embeds is None and isinstance(batch, dict):
-                    # SDXL scripts often store pooled embeds as text_embeds
-                    pooled_prompt_embeds = batch.get("pooled_prompt_embeds", batch.get("text_embeds"))
-                if pooled_prompt_embeds is None:
-                    if step == 0:
-                        print("batch keys:", batch.keys())
-                        print("unet_added_conditions keys:", batch["unet_added_conditions"].keys())
-
-                    raise ValueError(f"Batch missing pooled/text embeds. keys={list(batch.keys())}")
-
-                pooled_prompt_embeds = pooled_prompt_embeds.to(device=accelerator.device, dtype=weight_dtype)
-                # --------------------------------------------
                 model_pred = unet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=batch["prompt_ids"],
+                    encoder_hidden_states=batch["prompt_embeds"],            # ✅ 3D
                     added_cond_kwargs=batch["unet_added_conditions"],
-                    down_block_additional_residuals=[
-                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
-                    ],
+                    down_block_additional_residuals=[s.to(dtype=weight_dtype) for s in down_block_res_samples],
                     mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
                     return_dict=False,
                 )[0]

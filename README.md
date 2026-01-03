@@ -40,6 +40,47 @@ accelerate launch \
 
 ## Inference
 ```bash
+import torch
+from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline
+from PIL import Image
+
+ckpt = "/workspace/mri2datscan/models/controlnet_sdxl_ppmi/checkpoint-1000"
+
+# 1) controlnet을 fp16으로 로드 (핵심)
+cn = ControlNetModel.from_pretrained(
+    ckpt,
+    subfolder="controlnet",
+    torch_dtype=torch.float16,
+)
+
+# 2) SDXL base도 fp16 variant로 로드
+pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+    "stabilityai/stable-diffusion-xl-base-1.0",
+    controlnet=cn,
+    torch_dtype=torch.float16,
+    variant="fp16",
+    use_safetensors=True,
+).to("cuda")
+
+# 3) 혹시 남아있는 float32 강제 캐스팅 (안전장치)
+pipe.controlnet.to(dtype=torch.float16)
+pipe.unet.to(dtype=torch.float16)
+pipe.vae.to(dtype=torch.float16)
+pipe.text_encoder.to(dtype=torch.float16)
+pipe.text_encoder_2.to(dtype=torch.float16)
+
+cond = Image.open(
+    "/workspace/mri2datscan/ppmi_mri2datscan/data/train/conditioning/3107_dt2011-07-20_t12011-04-13_z031_00.png"
+).convert("RGB")
+
+prompt = "brain DaTSCAN SPECT, grayscale"
+
+with torch.autocast("cuda", dtype=torch.float16):
+    img = pipe(prompt=prompt, image=cond, num_inference_steps=30).images[0]
+
+out_path = "/workspace/mri2datscan/models/controlnet_sdxl_ppmi/sample_from_ckpt1000.png"
+img.save(out_path)
+print("saved to:", out_path)
 
 
 ```
