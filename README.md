@@ -6,9 +6,10 @@ python /workspace/PPMI_GEN/scripts/prepare_dataset.py \
   --ppmi_root /workspace/PPMI \
   --out_root /workspace/mri2datscan/ppmi_mri2datscan \
   --resolution 512 \
-  --n_slices 2 \
-  --max_delta_days 5000 \
+  --n_slices 7 \
+  --max_delta_days 365 \
   --max_pairs 50
+
 ```
 ## Train
 ```bash
